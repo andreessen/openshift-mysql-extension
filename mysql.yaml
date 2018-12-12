@@ -1,0 +1,220 @@
+apiVersion: v1
+kind: Template
+metadata:
+  name: mysql-ext
+parameters:
+- name: APP_NAME
+  required: true
+- name: APP_HOSTNAME
+  value: ''
+- name: BUILD_STRATEGY
+  description: 'It could be two strategies: source or docker'
+  from: '[sourcedk]'
+  value: docker
+- name: DB_MEMORY_LIMIT
+  value: 512Mi
+- name: DB_CPU_LIMIT
+  value: 300m
+- name: DB_NAME
+  required: true
+  value: apimgtdb
+- name: DB_USER
+  required: true
+  from: '[a-zA-Z0-9]{16}'
+  generate: expression
+- name: DB_PASSWORD
+  required: true
+  from: '[a-zA-Z0-9]{16}'
+  generate: expression 
+objects:
+- apiVersion: v1
+  kind: ImageStream
+  metadata:
+    labels:
+      app: ${APP_NAME}
+    name: ${APP_NAME}-mysql
+  spec:
+    lookupPolicy:
+      local: false
+    tags:
+    - from:
+        kind: DockerImage
+        name: ${APP_NAME}-mysql:latest
+      name: latest
+      referencePolicy:
+        type: ""           
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    labels:
+      app: ${APP_NAME}
+    name: ${APP_NAME}-mysql
+  spec:
+    resources:
+      limits:
+        memory: 512Mi
+        cpu: 500m
+      requests:
+        memory: 256Mi
+        cpu: 200m
+    output:
+      to:
+        kind: ImageStreamTag
+        name: ${APP_NAME}-mysql:latest
+    source:
+      dockerfile: "FROM registry.access.redhat.com/rhscl/mysql-57-rhel7\nUSER root\nRUN ls -la /etc/my.cnf.d && echo 'test' >> /tmp/test.txt && echo 'Done>>>>' && chmod g+w /etc/my.cnf && ls -la /etc/my.cnf.d \nUSER 185"
+      type: Dockerfile
+    strategy:
+      dockerStrategy:
+        from:
+          kind: ImageStreamTag
+          name: mysql:5.7
+          namespace: openshift
+      type: Docker
+    triggers:
+    - type: ConfigChange
+    - imageChange: {}
+      type: ImageChange
+- apiVersion: v1
+  kind: DeploymentConfig
+  metadata:
+    labels:
+      app: ${APP_NAME}
+    name: ${APP_NAME}-mysql
+  spec:
+    replicas: 1
+    selector:
+      name: ${APP_NAME}-mysql
+    strategy:
+      type: Rolling
+      rollingParams:
+        intervalSeconds: 1
+        maxSurge: 25%
+        maxUnavailable: 25%
+        post:
+          execNewPod:
+            command:
+            - /bin/sh
+            - -c
+            - hostname && echo '====' && printenv && echo '====' && echo $MYSQL_SERVICE_HOST && echo '====' && MYSQL_PWD="$MYSQL_ROOT_PASSWORD" && /opt/rh/rh-mysql57/root/usr/bin/mysql -h $MYSQL_SERVICE_HOST
+              -u root -p$MYSQL_ROOT_PASSWORD -P 3306 -e 'create database userdb;' && /opt/rh/rh-mysql57/root/usr/bin/mysql -h $MYSQL_SERVICE_HOST -u root -p$MYSQL_ROOT_PASSWORD -P 3306 -e 'create database regdb;' && /opt/rh/rh-mysql57/root/usr/bin/mysql -h $MYSQL_SERVICE_HOST
+              -u root -p$MYSQL_ROOT_PASSWORD -P 3306 -e 'create database statdb;' && /opt/rh/rh-mysql57/root/usr/bin/mysql -h $MYSQL_SERVICE_HOST
+              -u root -p$MYSQL_ROOT_PASSWORD -P 3306 -e 'create database mbstoredb;' && echo $MYSQL_USER && sleep 10 
+            containerName: mysql
+          failurePolicy: ignore
+        timeoutSeconds: 600
+        updatePeriodSeconds: 1
+    template:
+      metadata:
+        labels:
+          app: ${APP_NAME}-mysql
+          name: ${APP_NAME}-mysql
+      spec:
+        containers:
+        - env:
+          - name: MYSQL_USER
+            valueFrom:
+              secretKeyRef:
+                key: database-user
+                name: ${APP_NAME}-mysql
+          - name: MYSQL_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: database-password
+                name: ${APP_NAME}-mysql
+          - name: MYSQL_ROOT_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                key: database-root-password
+                name: ${APP_NAME}-mysql
+          - name: MYSQL_DATABASE
+            valueFrom:
+              secretKeyRef:
+                key: database-name
+                name: ${APP_NAME}-mysql
+          - name: MYSQL_SERVICE_HOST
+            value: ${APP_NAME}-mysql
+          - name: NAMESPACE_NAME
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace 
+          image: ' '
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            successThreshold: 1
+            tcpSocket:
+              port: 3306
+            timeoutSeconds: 1
+          name: mysql
+          ports:
+          - containerPort: 3306
+            protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - '-i'
+                - '-c'
+                - MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -h 127.0.0.1 -u root -D $MYSQL_DATABASE  -e "select 1;" 
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          resources:
+            limits:
+              memory: ${DB_MEMORY_LIMIT}
+              cpu: ${DB_CPU_LIMIT}
+            requests:
+              memory: ${DB_MEMORY_LIMIT}
+              cpu: ${DB_CPU_LIMIT}
+          volumeMounts:
+          - mountPath: /var/lib/mysql/data
+            name: ${APP_NAME}-mysql-data
+        dnsPolicy: ClusterFirst
+        restartPolicy: Always
+        volumes:
+        - name: ${APP_NAME}-mysql-data
+          emptyDir: {}
+    triggers:
+    - imageChangeParams:
+        automatic: true
+        containerNames:
+        - mysql
+        from:
+          kind: ImageStreamTag
+          name: ${APP_NAME}-mysql:latest
+      type: ImageChange
+    - type: ConfigChange      
+- apiVersion: v1
+  kind: Service
+  metadata:
+    labels:
+      app: ${APP_NAME}
+    name: ${APP_NAME}-mysql
+  spec:
+    ports:
+    - name: mysql
+      port: 3306
+      protocol: TCP
+      targetPort: 3306
+    selector:
+      name: ${APP_NAME}-mysql
+    sessionAffinity: None
+    type: ClusterIP
+- apiVersion: v1
+  kind: Secret
+  metadata:
+    labels:
+      app: ${APP_NAME}
+    name: ${APP_NAME}-mysql
+  stringData:
+    database-name: ${DB_NAME}
+    database-password: ${DB_PASSWORD}
+    database-root-password: ${DB_PASSWORD}
+    database-user: ${DB_USER}
+  type: Opaque              
